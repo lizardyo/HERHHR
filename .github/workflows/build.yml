@@ -1,0 +1,44 @@
+# Builds ReSkate v2.1.4-2 with the view cone patch on GitHub's own Windows machine.
+# Put this file in your repository at:  .github/workflows/build.yml
+name: Build ReSkate with view cone
+
+on:
+  workflow_dispatch: {}   # adds a "Run workflow" button on the Actions tab
+
+jobs:
+  build:
+    runs-on: windows-2022   # has Visual Studio 2022 and CMake already installed
+    steps:
+      - name: Get this repository (it holds the patch)
+        uses: actions/checkout@v4
+
+      - name: Get ReSkate v2.1.4-2
+        shell: bash
+        run: git clone --depth 1 --branch v2.1.4-2 https://github.com/Dingo-Shenanigans/ReSkate.git upstream
+
+      - name: Apply the view cone patch
+        shell: bash
+        working-directory: upstream
+        run: git apply --whitespace=nowarn ../reskate-view-cone-v2.1.4-2.patch
+
+      - name: Configure
+        working-directory: upstream
+        run: cmake --preset vs2022-x64 -DDINGOSDK_VERSION=2.1.4-2-viewcone
+
+      - name: Build the game DLL and the launcher
+        working-directory: upstream
+        run: cmake --build --preset release --target dingosdk_runtime dingosdk_launcher --parallel 4
+
+      - name: Gather the two files
+        shell: bash
+        run: |
+          mkdir out
+          cp upstream/build/vs2022-x64/Release/ReSkate.dll out/
+          cp upstream/build/vs2022-x64/Release/ReSkateLauncher.exe out/
+          ls -la out
+
+      - name: Upload them
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReSkate-viewcone-2.1.4-2
+          path: out/*
