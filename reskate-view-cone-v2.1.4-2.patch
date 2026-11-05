@@ -1,0 +1,551 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ca14297..c7a751c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -95,6 +95,9 @@ if(DINGOSDK_BUILD_MULTIPLAYER_TESTS)
+     add_executable(dingosdk_party_tests Extension/Multiplayer/Test/party_tests.cpp Extension/Multiplayer/Session/party_book.cpp)
+     target_include_directories(dingosdk_party_tests PRIVATE "${PROJECT_SOURCE_DIR}")
+     add_test(NAME multiplayer_parties COMMAND dingosdk_party_tests)
++    add_executable(dingosdk_view_cone_tests Extension/Multiplayer/Test/view_cone_tests.cpp)
++    target_include_directories(dingosdk_view_cone_tests PRIVATE "${PROJECT_SOURCE_DIR}")
++    add_test(NAME multiplayer_view_cone COMMAND dingosdk_view_cone_tests)
+     add_executable(dingosdk_server_activity_tests Server/Test/server_activity_tests.cpp Server/server_activity.cpp
+         Extension/Throwdowns/throwdown_wire.cpp)
+     target_include_directories(dingosdk_server_activity_tests PRIVATE "${PROJECT_SOURCE_DIR}")
+diff --git a/Engine/Game/Multiplayer/session_model.h b/Engine/Game/Multiplayer/session_model.h
+index 5a3ccf4..a5d714a 100644
+--- a/Engine/Game/Multiplayer/session_model.h
++++ b/Engine/Game/Multiplayer/session_model.h
+@@ -173,6 +173,11 @@ struct MultiplayerBan {
+     std::int64_t added{};      // Unix time
+ };
+ inline constexpr float player_distance_least = 50.f, player_distance_unlimited = 1000.f;
++// The view cone (Extension/Multiplayer/Session/view_cone.h): limits of each setting.
++inline constexpr float view_cone_angle_least = 60.f, view_cone_angle_most = 180.f;     // degrees across
++inline constexpr float view_cone_within_least = 10.f, view_cone_within_most = 100.f;   // metres
++inline constexpr int view_cone_rate_least = 5, view_cone_rate_most = 30;               // poses a second
++inline constexpr float view_cone_delay_least = 0.f, view_cone_delay_most = 10.f;       // seconds
+ struct MultiplayerModel {
+     VoiceModel voice;
+     std::vector<MultiplayerBan> bans;
+@@ -206,6 +211,16 @@ struct MultiplayerModel {
+     // it they keep their nametag or dot. Each skater costs memory and frame time, in view or
+     // not. `player_distance_unlimited` and above: every player, however far.
+     float player_distance{120.f};
++    // Local, off by default: players out of the camera's view, past `full_rate_within` metres, have
++    // their skater posed only `rate` times a second once they have been out of view for `delay`
++    // seconds. `angle` is the width of the cone, in degrees, that counts as in view. The skater is
++    // still there, so nothing respawns when the camera turns. Replays record those players at the
++    // lower rate too.
++    struct ViewCone {
++        bool enabled{};
++        float angle{140.f}, full_rate_within{25.f}, delay{1.5f};
++        int rate{20};
++    } view_cone;
+     // Local: connect straight to dedicated servers that offer it (their "connection": "direct")
+     // instead of through Steam's relays. Off: always the relays, and no server sees this PC's address.
+     bool prefer_direct{true};
+diff --git a/Extension/Multiplayer/Session/session.cpp b/Extension/Multiplayer/Session/session.cpp
+index 9ad3209..f492973 100644
+--- a/Extension/Multiplayer/Session/session.cpp
++++ b/Extension/Multiplayer/Session/session.cpp
+@@ -1,4 +1,5 @@
+ #include "session_internal.h"
++#include "view_cone.h"
+ #include "Extension/Throwdowns/throwdown_kit.h"
+ #include "Extension/Skater/skater_push.h"
+ #include "Extension/Throwdowns/throwdown_lab.h"
+@@ -331,6 +332,15 @@ void publish_party(Session &s) {
+         s.prefer_direct = profile_runtime::local_preference("DirectConnections").value_or(true);
+         if (const auto saved = profile_runtime::local_value("PlayerDistance"); saved && saved->is_number())
+             s.player_distance = std::clamp(saved->get<float>(), player_distance_least, player_distance_unlimited);
++        s.view_cone.enabled = profile_runtime::local_preference("ViewCone").value_or(false);
++        if (const auto saved = profile_runtime::local_value("ViewConeAngle"); saved && saved->is_number())
++            s.view_cone.angle = std::clamp(saved->get<float>(), view_cone_angle_least, view_cone_angle_most);
++        if (const auto saved = profile_runtime::local_value("ViewConeWithin"); saved && saved->is_number())
++            s.view_cone.full_rate_within = std::clamp(saved->get<float>(), view_cone_within_least, view_cone_within_most);
++        if (const auto saved = profile_runtime::local_value("ViewConeRate"); saved && saved->is_number())
++            s.view_cone.rate = std::clamp(static_cast<int>(saved->get<double>()), view_cone_rate_least, view_cone_rate_most);
++        if (const auto saved = profile_runtime::local_value("ViewConeDelay"); saved && saved->is_number())
++            s.view_cone.delay = std::clamp(saved->get<float>(), view_cone_delay_least, view_cone_delay_most);
+         s.nametags_friends = profile_runtime::local_preference("NametagsFriendsOnly").value_or(false);
+         s.chat_visible = profile_runtime::local_preference("ChatVisible").value_or(true);
+         s.chat_filter = profile_runtime::local_preference("ChatFilter").value_or(true);
+@@ -459,10 +469,11 @@ Pose out_of_sight(Pose pose) {
+ // local skater and the camera: every frame within 200 m, 20 Hz past it, 10 Hz past 350 m, and
+ // every frame again once back inside 190 m. Between samples the skater keeps its pose, which
+ // saves the interpolation, the pose copy and the skeleton write for players too far away to see.
+-// Only distance decides. Players out of the camera's view were sampled at 20 Hz as well for a
+-// while (it saved client-tick time on busy servers), but the game's replays record every skater
+-// as it stood each frame and their camera looks wherever it likes afterwards: a player who had
+-// been behind the camera moved at 20 Hz in the replay.
++// Only distance decides by default. Players out of the camera's view were sampled at 20 Hz as
++// well for a while (it saved client-tick time on busy servers), but the game's replays record
++// every skater as it stood each frame and their camera looks wherever it likes afterwards: a
++// player who had been behind the camera moved at 20 Hz in the replay. That is why the view cone
++// (view_cone.h) is a local setting, off until the player turns it on, and says so where they do.
+ constexpr int far_full_rate_return = 190, far_half_rate_start = 200, far_low_rate_start = 350;
+ // Metres from a player to the nearer of the local skater and a detached camera (spectating,
+ // replay or a drone; the follow camera orbits a few metres around the skater, which would
+@@ -644,7 +655,9 @@ void render(Session &s, std::uintptr_t client, const NativeFrame &local, std::ui
+         const bool was_visible = p.visible;
+         // A far player between samples: their skater keeps its pose; sound, the label and
+         // the spectate position are still refreshed (sound events are released one per frame).
+-        if (was_visible && local.ready && !p.render_failed && p.far_interval && now < p.next_far_sample) {
++        // A player the view cone slowed is sampled again at once when the camera turns back to them.
++        const bool cone_slow = p.cone_interval && !(view && in_view_cone(view->world, p.render_pose.root.position, s.view_cone.angle));
++        if (was_visible && local.ready && !p.render_failed && (p.far_interval || cone_slow) && now < p.next_far_sample) {
+             update_developer_hoodie(s.base, remote_skater_entity(), developer_id(p), remote_skater_generation(), p.developer_hoodie,
+                                     mark_styles(p));
+             update_developer_board(s.base, remote_board_entity(), developer_id(p), remote_skater_generation(), p.developer_board,
+@@ -689,7 +702,14 @@ void render(Session &s, std::uintptr_t client, const NativeFrame &local, std::ui
+                                         p.native_status);
+                 const auto distance = nearest_distance(p, local, view);
+                 p.far_interval = p.visible && !hidden ? far_sample_interval(p, distance) : 0;
+-                p.next_far_sample = now + p.far_interval;
++                if (p.visible && !hidden) {
++                    const bool in_view = !view || in_view_cone(view->world, p.render_pose.root.position, s.view_cone.angle);
++                    p.cone_interval = view_cone_interval(s.view_cone, in_view, distance, now, p.out_of_view_since);
++                } else {
++                    p.cone_interval = 0;
++                    p.out_of_view_since = 0;
++                }
++                p.next_far_sample = now + std::max(p.far_interval, p.cone_interval);
+                 // The native work a far player's skater may skip (puppet_cost.cpp).
+                 if (p.visible) note_remote_distance(distance);
+                 // Solid for the local skater within reach, when both have party collision on.
+diff --git a/Extension/Multiplayer/Session/session_commands.cpp b/Extension/Multiplayer/Session/session_commands.cpp
+index fefb225..0b73fff 100644
+--- a/Extension/Multiplayer/Session/session_commands.cpp
++++ b/Extension/Multiplayer/Session/session_commands.cpp
+@@ -467,6 +467,54 @@ std::string edit_player_distance(Session &s, std::string_view argument) {
+     return value >= player_distance_unlimited ? std::string("Every player is shown as a skater, however far.")
+                                               : "Players within " + std::to_string(static_cast<int>(value)) + " m are shown as skaters.";
+ }
++// A number in [least, most] for a view cone setting, or false (and the reply to give).
++bool view_cone_number(std::string_view argument, float least, float most, float &value) {
++    const auto parsed = std::from_chars(argument.data(), argument.data() + argument.size(), value);
++    return parsed.ec == std::errc{} && parsed.ptr == argument.data() + argument.size() && std::isfinite(value) &&
++           value >= least && value <= most;
++}
++std::string edit_view_cone(Session &s, std::string_view argument) {
++    const auto enabled = parse_switch(argument, s.view_cone.enabled);
++    if (!enabled) return "Use on, off, or toggle for the view cone.";
++    s.view_cone.enabled = *enabled;
++    profile_runtime::set_local_preference("ViewCone", s.view_cone.enabled);
++    return s.view_cone.enabled
++               ? "Players out of your camera's view are posed less often. Replays record them that way too."
++               : "Every player is posed every frame, in view or not.";
++}
++std::string edit_view_cone_angle(Session &s, std::string_view argument) {
++    float value{};
++    if (!view_cone_number(argument, view_cone_angle_least, view_cone_angle_most, value))
++        return "The view cone is a width in degrees from 60 to 180.";
++    s.view_cone.angle = value;
++    profile_runtime::set_local_values({{"ViewConeAngle", static_cast<double>(value)}});
++    return "Players within a " + std::to_string(static_cast<int>(value)) + " degree cone of your camera count as in view.";
++}
++std::string edit_view_cone_within(Session &s, std::string_view argument) {
++    float value{};
++    if (!view_cone_number(argument, view_cone_within_least, view_cone_within_most, value))
++        return "The view cone's full-rate distance is a number of metres from 10 to 100.";
++    s.view_cone.full_rate_within = value;
++    profile_runtime::set_local_values({{"ViewConeWithin", static_cast<double>(value)}});
++    return "Players within " + std::to_string(static_cast<int>(value)) + " m are never slowed.";
++}
++std::string edit_view_cone_rate(Session &s, std::string_view argument) {
++    float value{};
++    if (!view_cone_number(argument, static_cast<float>(view_cone_rate_least), static_cast<float>(view_cone_rate_most), value))
++        return "The view cone's rate is a number of poses a second from 5 to 30.";
++    s.view_cone.rate = static_cast<int>(value);
++    profile_runtime::set_local_values({{"ViewConeRate", static_cast<std::int64_t>(s.view_cone.rate)}});
++    return "Players out of view are posed " + std::to_string(s.view_cone.rate) + " times a second.";
++}
++std::string edit_view_cone_delay(Session &s, std::string_view argument) {
++    float value{};
++    if (!view_cone_number(argument, view_cone_delay_least, view_cone_delay_most, value))
++        return "The view cone's delay is a number of seconds from 0 to 10.";
++    s.view_cone.delay = value;
++    profile_runtime::set_local_values({{"ViewConeDelay", static_cast<double>(value)}});
++    return "Players are slowed after " + std::to_string(static_cast<int>(value * 10.f + .5f) / 10) + "." +
++           std::to_string(static_cast<int>(value * 10.f + .5f) % 10) + " s out of view.";
++}
+ std::string start_pose_dump(Session &s, std::string_view argument) {
+ #if defined(DINGOSDK_LEAN_PLAYTEST)
+     (void)s; (void)argument;
+@@ -674,7 +722,8 @@ bool queue_command(std::string_view action, std::string_view argument, std::stri
+     if ((action != "host" && action != "host-config" && action != "join" && action != "rejoin" && action != "join-lobby" && action != "join-friend-lobby" && action != "stop" && action != "stop-map-fetch" &&
+          action != "distances" && action != "object-placement" && action != "object-limit" && action != "kick" && action != "clear-objects" &&
+          action != "nametags" && action != "chat-visible" && action != "chat-filter" &&
+-         action != "nametag-distance" && action != "nametag-dots" && action != "nametags-friends" && action != "player-distance" && action != "direct-connections" && action != "pose-dump" && action != "vote" && action != "voice-chat" &&
++         action != "nametag-distance" && action != "nametag-dots" && action != "nametags-friends" && action != "player-distance" && action != "view-cone" && action != "view-cone-angle" && action != "view-cone-within" &&
++         action != "view-cone-rate" && action != "view-cone-delay" && action != "direct-connections" && action != "pose-dump" && action != "vote" && action != "voice-chat" &&
+          action != "chat-bubbles" && action != "chat-bubbles-own" && action != "chat-bubbles-distance" &&
+          action != "chat-bubbles-duration" && action != "chat-bubbles-history" &&
+          !own_mark_command(action) &&
+@@ -930,7 +979,9 @@ std::string command(std::string_view action, std::string_view argument, std::str
+             {"world-layer-sync", edit_world_layer_sync},   {"distances", edit_distances},
+             {"nametags", edit_nametags},
+             {"nametag-distance", edit_nametag_distance}, {"nametag-dots", edit_nametag_dots},
+-            {"nametags-friends", edit_nametags_friends}, {"player-distance", edit_player_distance}, {"direct-connections", edit_direct_connections}, {"pose-dump", start_pose_dump},
++            {"nametags-friends", edit_nametags_friends}, {"player-distance", edit_player_distance},
++            {"view-cone", edit_view_cone}, {"view-cone-angle", edit_view_cone_angle}, {"view-cone-within", edit_view_cone_within},
++            {"view-cone-rate", edit_view_cone_rate}, {"view-cone-delay", edit_view_cone_delay}, {"direct-connections", edit_direct_connections}, {"pose-dump", start_pose_dump},
+             {"mark-tag", edit_own_tag}, {"mark-items", edit_own_items}, {"mark-style", edit_mark_style},
+             {"chat-visible", edit_chat_visible}, {"chat-filter", edit_chat_filter},
+             {"chat-bubbles", edit_chat_bubbles}, {"chat-bubbles-own", edit_chat_bubbles_own},
+@@ -966,6 +1017,8 @@ std::string command(std::string_view action, std::string_view argument, std::str
+                 remove_remote(s.base);
+                 p.render_failed = false;
+                 p.far_interval = 0;
++                p.cone_interval = 0;
++                p.out_of_view_since = 0;
+                 p.last_cosmetic_apply = 0;
+             });
+             s.status = "Retrying remote skater creation.";
+diff --git a/Extension/Multiplayer/Session/session_internal.h b/Extension/Multiplayer/Session/session_internal.h
+index 9a5ff85..f2ab276 100644
+--- a/Extension/Multiplayer/Session/session_internal.h
++++ b/Extension/Multiplayer/Session/session_internal.h
+@@ -112,6 +112,9 @@ struct Peer {
+     // Far from the local skater and the camera, render_pose is sampled every far_interval
+     // (0: every frame) and the skater keeps it in between.
+     std::uint64_t far_interval{}, next_far_sample{};
++    // The view cone's own slowing (view_cone.h), kept apart from far_interval so the distance
++    // rule's hysteresis is unchanged: the time between samples, and when the player went out of view.
++    std::uint64_t cone_interval{}, out_of_view_since{};
+     AppearanceBuffer appearance;
+     // Bumped per accepted outfit; render compares it with the one its actor wears
+     // (0 after a spawn) to spread native recipe applies over frames.
+@@ -302,6 +305,8 @@ struct Session {
+     float nametag_distance = 120.f; // names within this many metres, dots past it
+     // Only players within this many metres have a skater (session.cpp); checked a few times a second.
+     float player_distance = 120.f;
++    // Local, off by default (view_cone.h): slow the skaters of players out of the camera's view.
++    MultiplayerModel::ViewCone view_cone;
+     bool prefer_direct = true; // straight to servers that offer it, not through the relays
+     // Poses from a dedicated server (pose_batch.h): each player's stream as this game holds it,
+     // and which of the server's messages were read in full, which it is told once a tick.
+diff --git a/Extension/Multiplayer/Session/session_view.cpp b/Extension/Multiplayer/Session/session_view.cpp
+index 80dbf19..b3ed914 100644
+--- a/Extension/Multiplayer/Session/session_view.cpp
++++ b/Extension/Multiplayer/Session/session_view.cpp
+@@ -246,6 +246,7 @@ void publish(Session &s, const NativeFrame *local) {
+         view.server_map_votes = (s.server_votes & server_vote_map) != 0;
+     }
+     view.player_distance = s.player_distance;
++    view.view_cone = s.view_cone;
+     view.prefer_direct = s.prefer_direct;
+     view.nametag_distance = s.nametag_distance;
+     view.nametag_dots = s.nametag_dots;
+diff --git a/Extension/Multiplayer/Session/view_cone.h b/Extension/Multiplayer/Session/view_cone.h
+new file mode 100644
+index 0000000..bab9f5f
+--- /dev/null
++++ b/Extension/Multiplayer/Session/view_cone.h
+@@ -0,0 +1,47 @@
++#pragma once
++// The view cone: whether a player is inside the camera's view, and how slowly an out-of-view
++// player's skater is posed (session.cpp). Maths only, no game state, so Test/view_cone_tests.cpp
++// covers it without a game.
++#include "Engine/Game/Multiplayer/session_model.h"
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdint>
++
++namespace dingosdk {
++// Whether `at` is inside the cone around where the camera looks, `angle_degrees` across. `world`
++// is the camera's world matrix: rows right, up, back, position (game_view.h), so it looks down the
++// negative of its back row. A skater is not a point: its board and arms reach about two metres
++// from `at`, so the cone is widened by the angle that radius covers at that distance and a player
++// just outside it is not slowed while part of them is on screen. Anything the maths cannot decide
++// (a player at the camera, a degenerate matrix, NaN) is in view: that is the full rate.
++inline bool in_view_cone(const std::array<float, 16> &world, const std::array<float, 3> &at, float angle_degrees) noexcept {
++    constexpr float reach = 2.f, half_turn = 3.14159265358979f;
++    const float dx = at[0] - world[12], dy = at[1] - world[13], dz = at[2] - world[14];
++    const float distance_squared = dx * dx + dy * dy + dz * dz;
++    if (!(distance_squared > reach * reach)) return true;
++    const float fx = -world[8], fy = -world[9], fz = -world[10];
++    const float forward = std::sqrt(fx * fx + fy * fy + fz * fz);
++    if (!(forward > 1e-4f)) return true;
++    const float distance = std::sqrt(distance_squared);
++    const float cosine = std::clamp((dx * fx + dy * fy + dz * fz) / (distance * forward), -1.f, 1.f);
++    const float half = std::clamp(angle_degrees, view_cone_angle_least, view_cone_angle_most) * 0.5f * half_turn / 180.f;
++    const float widened = half + std::asin(std::min(1.f, reach / distance));
++    return std::acos(cosine) <= widened;
++}
++// Microseconds between poses for a player the cone slows; 0 is every frame. `since` is where the
++// player's run out of view started (0: not out of view) and is kept by the caller per player. A
++// player in view, near, or not yet out of view for `delay` seconds is at the full rate, so
++// turning the camera back never leaves them frozen and a quick glance away costs nothing.
++inline std::uint64_t view_cone_interval(const MultiplayerModel::ViewCone &cone, bool in_view, float distance,
++                                        std::uint64_t now, std::uint64_t &since) noexcept {
++    if (!cone.enabled || in_view || !std::isfinite(distance) || distance <= cone.full_rate_within) {
++        since = 0;
++        return 0;
++    }
++    if (since == 0) since = now ? now : 1;
++    const auto delay = static_cast<std::uint64_t>(std::clamp(cone.delay, view_cone_delay_least, view_cone_delay_most) * 1e6f);
++    if (now < since || now - since < delay) return 0;
++    return 1000000 / static_cast<std::uint64_t>(std::clamp(cone.rate, view_cone_rate_least, view_cone_rate_most));
++}
++} // namespace dingosdk
+diff --git a/Extension/Multiplayer/Test/view_cone_tests.cpp b/Extension/Multiplayer/Test/view_cone_tests.cpp
+new file mode 100644
+index 0000000..5c1e816
+--- /dev/null
++++ b/Extension/Multiplayer/Test/view_cone_tests.cpp
+@@ -0,0 +1,113 @@
++// The view cone's maths (Extension/Multiplayer/Session/view_cone.h): which players count as in view
++// and when an out-of-view player is slowed. No game process is opened.
++#include "Extension/Multiplayer/Session/view_cone.h"
++#include <cmath>
++#include <cstdlib>
++#include <iostream>
++#include <limits>
++#include <string>
++
++using namespace dingosdk;
++namespace {
++void check(bool ok, const std::string &message) {
++    if (ok) return;
++    std::cerr << message << '\n';
++    std::exit(1);
++}
++// A camera at the origin looking down -Z: the rows are right, up, back, position.
++std::array<float, 16> camera_at_origin() {
++    return {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
++}
++// A point `metres` away, `degrees` to the right of where that camera looks.
++std::array<float, 3> point(float metres, float degrees) {
++    const float turn = degrees * 3.14159265358979f / 180.f;
++    return {metres * std::sin(turn), 0.f, -metres * std::cos(turn)};
++}
++
++void cone_shape() {
++    const auto camera = camera_at_origin();
++    check(in_view_cone(camera, point(50.f, 0.f), 140.f), "A player dead ahead was out of view");
++    check(!in_view_cone(camera, point(50.f, 180.f), 140.f), "A player directly behind the camera was in view");
++    check(in_view_cone(camera, point(50.f, 60.f), 140.f), "A player inside a 140 degree cone was out of view");
++    check(!in_view_cone(camera, point(50.f, 80.f), 140.f), "A player well outside a 140 degree cone was in view");
++    check(in_view_cone(camera, point(50.f, -60.f), 140.f), "The cone was not the same on the left");
++    // The widest cone is the half space in front, plus a skater's reach.
++    check(in_view_cone(camera, point(50.f, 90.f), 180.f), "A player at 90 degrees was out of a 180 degree cone");
++    check(!in_view_cone(camera, point(50.f, 120.f), 180.f), "A player behind the side was in a 180 degree cone");
++    // A skater is not a point: nearer players get more slack past the edge, because more of them reaches in.
++    check(in_view_cone(camera, point(20.f, 74.f), 140.f), "A player 4 degrees past the edge at 20 m was not given their width");
++    check(!in_view_cone(camera, point(20.f, 80.f), 140.f), "A player 10 degrees past the edge at 20 m was in view");
++    check(!in_view_cone(camera, point(200.f, 74.f), 140.f), "Far players got as much slack as near ones");
++    // Narrower than the least is the least.
++    check(in_view_cone(camera, point(50.f, 25.f), 10.f), "An angle below the least was not raised to it");
++    check(!in_view_cone(camera, point(50.f, 45.f), 10.f), "An angle below the least was not raised to exactly it");
++}
++
++void fails_safe() {
++    const auto camera = camera_at_origin();
++    check(in_view_cone(camera, {0.f, 0.f, 1.5f}, 60.f), "A player within a skater's reach of the camera was out of view");
++    check(in_view_cone(camera, {0.f, 0.f, 0.f}, 60.f), "A player at the camera was out of view");
++    const float nan = std::numeric_limits<float>::quiet_NaN();
++    check(in_view_cone(camera, {nan, 0.f, 0.f}, 60.f), "A NaN position was out of view");
++    check(in_view_cone(std::array<float, 16>{}, {0.f, 0.f, 50.f}, 60.f), "A zero matrix was out of view");
++    // The camera moved: the cone follows the position row and turns with the back row.
++    auto turned = camera_at_origin();
++    turned[8] = 1.f, turned[10] = 0.f; // back = +X, so it looks down -X
++    turned[12] = 100.f;
++    check(in_view_cone(turned, {50.f, 0.f, 0.f}, 90.f), "A turned and moved camera did not see ahead of it");
++    check(!in_view_cone(turned, {150.f, 0.f, 0.f}, 90.f), "A turned and moved camera saw behind it");
++}
++
++MultiplayerModel::ViewCone cone_on() {
++    MultiplayerModel::ViewCone cone;
++    cone.enabled = true;
++    cone.full_rate_within = 25.f;
++    cone.delay = 1.5f;
++    cone.rate = 20;
++    return cone;
++}
++
++void timing() {
++    constexpr std::uint64_t second = 1000000;
++    auto cone = cone_on();
++    std::uint64_t since = 7;
++    check(view_cone_interval(cone_on(), true, 100.f, 10 * second, since) == 0 && since == 0, "A player in view was slowed");
++    cone.enabled = false;
++    check(view_cone_interval(cone, false, 100.f, 10 * second, since) == 0 && since == 0, "A disabled cone slowed a player");
++    cone.enabled = true;
++    check(view_cone_interval(cone, false, 10.f, 10 * second, since) == 0 && since == 0, "A player within the full-rate distance was slowed");
++    check(view_cone_interval(cone, false, std::numeric_limits<float>::infinity(), 10 * second, since) == 0, "An unknown distance was slowed");
++
++    // Out of view and far: the delay first, then 20 poses a second.
++    check(view_cone_interval(cone, false, 100.f, 10 * second, since) == 0 && since == 10 * second, "The out-of-view time did not start");
++    check(view_cone_interval(cone, false, 100.f, 10 * second + 1400000, since) == 0, "A player was slowed before the delay");
++    check(view_cone_interval(cone, false, 100.f, 10 * second + 1500000, since) == 50000, "A player was not slowed after the delay at 20 a second");
++    check(since == 10 * second, "The out-of-view start moved while the player stayed out of view");
++    // Turning back: full rate at once, and the delay starts over the next time they leave view.
++    check(view_cone_interval(cone, true, 100.f, 12 * second, since) == 0 && since == 0, "Coming back into view did not clear the slowing");
++    check(view_cone_interval(cone, false, 100.f, 13 * second, since) == 0, "A player was slowed the moment they left view again");
++
++    // The settings' limits: a rate or delay out of range is held to the limit.
++    cone.delay = 0.f;
++    cone.rate = 1;
++    since = 0;
++    check(view_cone_interval(cone, false, 100.f, 20 * second, since) == 200000, "A rate below the least was not held to 5 a second");
++    cone.rate = 1000;
++    check(view_cone_interval(cone, false, 100.f, 20 * second, since) == 33333, "A rate above the most was not held to 30 a second");
++    cone.delay = -5.f;
++    since = 0;
++    check(view_cone_interval(cone, false, 100.f, 30 * second, since) == 33333, "A negative delay was not held to none");
++    // A clock that starts at zero still starts the out-of-view time.
++    since = 0;
++    cone.delay = 1.5f;
++    check(view_cone_interval(cone, false, 100.f, 0, since) == 0 && since == 1, "A clock at zero did not start the out-of-view time");
++}
++} // namespace
++
++int main() {
++    cone_shape();
++    fails_safe();
++    timing();
++    std::cout << "view cone: ok\n";
++    return 0;
++}
+diff --git a/Extension/Multiplayer/console_commands.cpp b/Extension/Multiplayer/console_commands.cpp
+index 7a7e839..7639f1e 100644
+--- a/Extension/Multiplayer/console_commands.cpp
++++ b/Extension/Multiplayer/console_commands.cpp
+@@ -38,6 +38,11 @@ void register_multiplayer_commands(Commands &registry) {
+                           Command{"voice-chat", "Your own voice chat (on, off, toggle)"},
+                           Command{"direct-connections", "Connect straight to servers that offer it, not through Steam's relays (on, off, toggle)"},
+                           Command{"player-distance", "How far away another player still gets a skater, in metres (50-1000; 1000: every player). Past it: a nametag or dot"},
++                          Command{"view-cone", "Pose players out of your camera's view less often (on, off, toggle). Replays record them that way too"},
++                          Command{"view-cone-angle", "How wide the cone around your camera is that counts as in view, in degrees (60-180)"},
++                          Command{"view-cone-within", "Players nearer than this many metres are never slowed (10-100)"},
++                          Command{"view-cone-rate", "Poses a second for a player out of view (5-30)"},
++                          Command{"view-cone-delay", "Seconds out of view before a player is slowed (0-10)"},
+                           Command{"nametag-distance", "How far away a player's name still shows, in metres (10-500); past it they are a dot"},
+                           Command{"nametag-dots", "Show far and off-screen players as dots (on, off, toggle)"},
+                           Command{"nametags-friends", "Only your Steam friends have nametags (on, off, toggle)"},
+@@ -66,12 +71,18 @@ void register_multiplayer_commands(Commands &registry) {
+             std::string_view(c.name) == "chat-bubbles" || std::string_view(c.name) == "chat-bubbles-own" ||
+             std::string_view(c.name) == "nametag-dots" || std::string_view(c.name) == "nametags-friends" ||
+             std::string_view(c.name) == "direct-connections" || std::string_view(c.name) == "vote" ||
+-            std::string_view(c.name) == "voice-chat" ||
++            std::string_view(c.name) == "voice-chat" || std::string_view(c.name) == "view-cone" ||
+             std::string_view(c.name) == "score-check")
+             args.push_back(argument("choice"));
+-        if (std::string_view(c.name) == "chat-bubbles-distance" || std::string_view(c.name) == "nametag-distance")
++        if (std::string_view(c.name) == "chat-bubbles-distance" || std::string_view(c.name) == "nametag-distance" ||
++            std::string_view(c.name) == "view-cone-within")
+             args.push_back(argument("metres"));
+-        if (std::string_view(c.name) == "chat-bubbles-duration" || std::string_view(c.name) == "pose-dump")
++        if (std::string_view(c.name) == "view-cone-angle")
++            args.push_back(argument("degrees"));
++        if (std::string_view(c.name) == "view-cone-rate")
++            args.push_back(argument("poses"));
++        if (std::string_view(c.name) == "chat-bubbles-duration" || std::string_view(c.name) == "pose-dump" ||
++            std::string_view(c.name) == "view-cone-delay")
+             args.push_back(argument("seconds"));
+         if (std::string_view(c.name) == "player-distance")
+             args.push_back(argument("metres"));
+diff --git a/Extension/UI/Overlay/hub_page.cpp b/Extension/UI/Overlay/hub_page.cpp
+index 2cc0884..fdac52d 100644
+--- a/Extension/UI/Overlay/hub_page.cpp
++++ b/Extension/UI/Overlay/hub_page.cpp
+@@ -1270,11 +1270,27 @@ void tools_page(Ui &ui, ImVec2 a, ImVec2 z) {
+         } else {
+             constexpr std::array<float, 8> shown{50.f, 75.f, 100.f, 150.f, 200.f, 300.f, 500.f, 1000.f};
+             constexpr std::array<float, 8> tags{10.f, 25.f, 50.f, 75.f, 120.f, 200.f, 300.f, 500.f};
++            constexpr std::array<float, 6> cone_angles{60.f, 90.f, 120.f, 140.f, 160.f, 180.f};
++            constexpr std::array<float, 6> cone_within{10.f, 15.f, 25.f, 40.f, 60.f, 100.f};
++            constexpr std::array<float, 5> cone_rates{5.f, 10.f, 15.f, 20.f, 30.f};
++            constexpr std::array<float, 6> cone_delays{0.f, 1.f, 2.f, 3.f, 5.f, 10.f};
+             constexpr std::array<float, 7> reach{5.f, 10.f, 20.f, 40.f, 75.f, 120.f, 200.f};
+             constexpr std::array<float, 6> seconds{1.f, 3.f, 5.f, 8.f, 15.f, 30.f};
+             constexpr std::array<float, 8> lines{1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f, 8.f};
+             if (const int way = list.adjust("Player distance", mp.player_distance >= player_distance_unlimited ? std::string("Everyone") : whole(mp.player_distance, " m"), true))
+                 online("player-distance", whole(stepped(mp.player_distance, shown, way)));
++            list.title("VIEW CONE");
++            if (list.setting("Slow players out of view", on_off(mp.view_cone.enabled), true)) online("view-cone", mp.view_cone.enabled ? "off" : "on");
++            if (const int way = list.adjust("View angle", whole(mp.view_cone.angle, " deg"), mp.view_cone.enabled))
++                online("view-cone-angle", whole(stepped(mp.view_cone.angle, cone_angles, way)));
++            if (const int way = list.adjust("Never slow within", whole(mp.view_cone.full_rate_within, " m"), mp.view_cone.enabled))
++                online("view-cone-within", whole(stepped(mp.view_cone.full_rate_within, cone_within, way)));
++            if (const int way = list.adjust("Slowed rate", whole(static_cast<float>(mp.view_cone.rate), " per s"), mp.view_cone.enabled))
++                online("view-cone-rate", whole(stepped(static_cast<float>(mp.view_cone.rate), cone_rates, way)));
++            if (const int way = list.adjust("Slow after", whole(mp.view_cone.delay, " s"), mp.view_cone.enabled))
++                online("view-cone-delay", whole(stepped(mp.view_cone.delay, cone_delays, way)));
++            list.note("Players out of your camera's view are posed less often, which saves frame time on a busy server. "
++                      "Nothing respawns when you turn. Replays and clips record those players at the lower rate too.");
+             if (list.setting("Direct connections", on_off(mp.prefer_direct), true)) online("direct-connections", mp.prefer_direct ? "off" : "on");
+             list.title("NAMETAGS");
+             if (list.setting("Nametags", on_off(mp.nametags), true)) online("nametags", mp.nametags ? "off" : "on");
+diff --git a/Extension/UI/Overlay/multiplayer_menu.cpp b/Extension/UI/Overlay/multiplayer_menu.cpp
+index fd24b4c..eebd256 100644
+--- a/Extension/UI/Overlay/multiplayer_menu.cpp
++++ b/Extension/UI/Overlay/multiplayer_menu.cpp
+@@ -262,6 +262,50 @@ void multiplayer_display_settings(SkateMenu &menu, const Model &model) {
+             (*menu.player_distance_pending == mp.player_distance || ImGui::GetTime() >= menu.player_distance_until))
+             menu.player_distance_pending.reset();
+     }
++    bool cone = mp.view_cone.enabled;
++    if (toggle_row(menu, "Slow players out of view",
++                   "Pose players outside your camera's view less often: less frame time on a busy server, and nothing respawns when "
++                   "you turn. Replays and clips record those players at the lower rate too. Players near you are never slowed.",
++                   cone)) {
++        std::array<char, 65> unused{};
++        send_private(menu, "view-cone", cone ? "on" : "off", unused, false);
++    }
++    if (mp.view_cone.enabled) {
++        std::array<char, 65> unused{};
++        const auto cone_slider = [&](const char *label, const char *hint, const char *id, const char *command, float least, float most,
++                                     const char *format, float current, std::optional<float> &pending, double &until) {
++            field(menu, label, hint);
++            float shown = pending.value_or(current);
++            ::dingosdk::overlay::menu::slider_float(id, &shown, least, most, format, ImGuiSliderFlags_AlwaysClamp);
++            if (ImGui::IsItemActive()) pending = shown;
++            if (ImGui::IsItemDeactivatedAfterEdit()) {
++                send_private(menu, command, std::to_string(static_cast<int>(shown + .5f)), unused, false);
++                until = ImGui::GetTime() + 2;
++            }
++            if (!ImGui::IsItemActive() && pending && (*pending == current || ImGui::GetTime() >= until)) pending.reset();
++        };
++        cone_slider("View angle", "How wide the cone around your camera is that counts as in view. Wider keeps more players at full rate.",
++                    "##view-cone-angle", "view-cone-angle", view_cone_angle_least, view_cone_angle_most, "%.0f deg",
++                    mp.view_cone.angle, menu.view_cone_angle_pending, menu.view_cone_angle_until);
++        cone_slider("Never slow within", "Players nearer than this are always posed every frame, in view or not.",
++                    "##view-cone-within", "view-cone-within", view_cone_within_least, view_cone_within_most, "%.0f m",
++                    mp.view_cone.full_rate_within, menu.view_cone_within_pending, menu.view_cone_within_until);
++        cone_slider("Slow after", "How long a player must stay out of view before they are slowed. A quick glance away costs nothing.",
++                    "##view-cone-delay", "view-cone-delay", view_cone_delay_least, view_cone_delay_most, "%.0f s",
++                    mp.view_cone.delay, menu.view_cone_delay_pending, menu.view_cone_delay_until);
++        field(menu, "Slowed rate", "Poses a second for a player out of view. Lower saves more and looks choppier on replays.");
++        float rate = static_cast<float>(menu.view_cone_rate_pending.value_or(mp.view_cone.rate));
++        ::dingosdk::overlay::menu::slider_float("##view-cone-rate", &rate, static_cast<float>(view_cone_rate_least),
++                                                static_cast<float>(view_cone_rate_most), "%.0f per s", ImGuiSliderFlags_AlwaysClamp);
++        if (ImGui::IsItemActive()) menu.view_cone_rate_pending = static_cast<int>(rate + .5f);
++        if (ImGui::IsItemDeactivatedAfterEdit()) {
++            send_private(menu, "view-cone-rate", std::to_string(static_cast<int>(rate + .5f)), unused, false);
++            menu.view_cone_rate_until = ImGui::GetTime() + 2;
++        }
++        if (!ImGui::IsItemActive() && menu.view_cone_rate_pending &&
++            (*menu.view_cone_rate_pending == mp.view_cone.rate || ImGui::GetTime() >= menu.view_cone_rate_until))
++            menu.view_cone_rate_pending.reset();
++    }
+     bool direct = mp.prefer_direct;
+     if (toggle_row(menu, "Direct connections",
+                    "Connect straight to dedicated servers that offer it: the shortest route, so the lowest ping. The server can then "
+diff --git a/Extension/UI/Overlay/skate_menu.h b/Extension/UI/Overlay/skate_menu.h
+index 34add7c..8c1514e 100644
+--- a/Extension/UI/Overlay/skate_menu.h
++++ b/Extension/UI/Overlay/skate_menu.h
+@@ -59,6 +59,9 @@ struct SkateMenu {
+     double nametag_distance_until{};
+     std::optional<float> player_distance_pending;
+     double player_distance_until{};
++    std::optional<float> view_cone_angle_pending, view_cone_within_pending, view_cone_delay_pending;
++    std::optional<int> view_cone_rate_pending;
++    double view_cone_angle_until{}, view_cone_within_until{}, view_cone_rate_until{}, view_cone_delay_until{};
+     std::optional<int> chat_bubbles_history_pending;
+     double chat_bubbles_distance_until{}, chat_bubbles_duration_until{}, chat_bubbles_history_until{};
+     std::map<std::uint64_t, std::pair<float, double>> voice_volume_pending;
