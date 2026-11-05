@@ -21,9 +21,25 @@ jobs:
         working-directory: upstream
         run: git apply --whitespace=nowarn ../reskate-view-cone-v2.1.4-2.patch
 
+      # ReSkate's Spotify helper is written in Rust. GitHub's machine has Rust but has not downloaded
+      # the helper's libraries yet, and the CMake step needs them: build the helper first. If this step
+      # fails, the next one builds ReSkate without the Spotify device instead of stopping.
+      - name: Build the Spotify helper (Rust)
+        id: spotify
+        continue-on-error: true
+        working-directory: upstream/SpotifyHelper
+        run: cargo build --release --lib
+
       - name: Configure
+        shell: bash
         working-directory: upstream
-        run: cmake --preset vs2022-x64 "-DDINGOSDK_VERSION=2.1.4-2-viewcone"
+        run: |
+          EXTRA=""
+          if [ "${{ steps.spotify.outcome }}" != "success" ]; then
+            echo "Spotify helper did not build: building without the Spotify device."
+            EXTRA="-DDINGOSDK_CARGO=NOTFOUND"
+          fi
+          cmake --preset vs2022-x64 "-DDINGOSDK_VERSION=2.1.4-2-viewcone" $EXTRA
 
       - name: Build the game DLL and the launcher
         working-directory: upstream
